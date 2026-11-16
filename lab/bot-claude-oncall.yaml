@@ -1,0 +1,10 @@
+# The agent's identity. Created from this file so that no join token is issued as a side effect:
+# demo.sh asks for a one-time token only when tbot is about to use it.
+kind: bot
+version: v1
+metadata:
+  name: claude-oncall
+spec:
+  roles: [claude-oncall]
+  # 15 minutes, enforced by the cluster and not only requested by tbot.
+  max_session_ttl: 900s

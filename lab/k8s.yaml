@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+# Teleport impersonates this group for the agent. Kubernetes gives it the built-in view role in
+# the shop namespace only, so the limit holds in Kubernetes as well as in Teleport.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oncall-readers-view
+  namespace: shop
+subjects:
+  - kind: Group
+    name: oncall-readers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+---
+# Namespace names only, so the agent can find where to look.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: oncall-namespaces
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oncall-readers-namespaces
+subjects:
+  - kind: Group
+    name: oncall-readers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: oncall-namespaces
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+          ports:
+            - containerPort: 80
+---
+# A lab app that fails on purpose. It never connects to the database: a real connection
+# would need a static credential in the cluster, which is the practice this demo argues against.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-api
+  namespace: shop
+data:
+  main.py: |
+    import sys
+    import time
+
+    print("orders-api 2.14.0 starting", flush=True)
+    print("loading configuration: region=eu-west-1 database=shop", flush=True)
+    time.sleep(2)
+    print("running schema check against migration 0042", flush=True)
+    time.sleep(1)
+    print(
+        "schema check failed: migration 0042 expects orders.currency, column not found",
+        file=sys.stderr,
+        flush=True,
+    )
+    sys.exit(1)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: orders-api}
+  template:
+    metadata:
+      labels: {app: orders-api}
+    spec:
+      containers:
+        - name: orders-api
+          image: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+          command: ["python", "/app/main.py"]
+          volumeMounts:
+            - name: app
+              mountPath: /app
+      volumes:
+        - name: app
+          configMap:
+            name: orders-api

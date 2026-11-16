@@ -1,0 +1,31 @@
+# What the on-call agent may do. Everything not listed here is refused by Teleport.
+kind: role
+version: v8
+metadata:
+  name: claude-oncall
+  description: Read-only on-call access to the shop database and the shop namespace
+spec:
+  options:
+    # The cluster refuses to issue this role for longer, whatever the client asks.
+    max_session_ttl: 15m
+  allow:
+    # Database: one database, one read-only user. The agent cannot pick another.
+    db_labels:
+      env: demo
+    db_names: [shop]
+    db_users: [oncall_ro]
+
+    # Kubernetes: read verbs on workloads in the shop namespace.
+    kubernetes_labels:
+      env: demo
+    kubernetes_groups: [oncall-readers]
+    kubernetes_resources:
+      - {kind: namespaces, api_group: '', name: shop, verbs: [get, list, watch]}
+      - {kind: pods, api_group: '', namespace: shop, name: '*', verbs: [get, list, watch]}
+      - {kind: events, api_group: '', namespace: shop, name: '*', verbs: [get, list, watch]}
+      - {kind: deployments, api_group: apps, namespace: shop, name: '*', verbs: [get, list, watch]}
+      - {kind: replicasets, api_group: apps, namespace: shop, name: '*', verbs: [get, list, watch]}
+  deny:
+    # Secrets are off limits in every namespace, whatever else is granted later.
+    kubernetes_resources:
+      - {kind: secrets, api_group: '', namespace: '*', name: '*', verbs: ['*']}

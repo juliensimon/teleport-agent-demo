@@ -1,0 +1,6 @@
+.state/
+.tools/
+.mcp.json
+diagram/icons/
+*.log
+*.pdf

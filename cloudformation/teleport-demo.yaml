@@ -1,0 +1,596 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Teleport agent demo. One EC2 host running Teleport Community Edition (Auth, Proxy,
+  Kubernetes and Database services) next to a single-node k3s cluster, plus a private
+  RDS PostgreSQL instance with IAM authentication. Deleting the stack removes everything.
+
+# What you get
+#   - A dedicated VPC. One public subnet for the host, two private subnets for the database.
+#   - One EC2 host with an Elastic IP. Port 443 is the only port open to the internet.
+#     No SSH: the host is administered through Systems Manager.
+#   - Teleport and k3s installed at pinned versions, each download checked against a
+#     SHA-256 recorded in this template.
+#   - RDS PostgreSQL with no public address, IAM authentication and no long-lived password
+#     in use: the master password lives in Secrets Manager and is read once, to load the lab.
+#   - Nothing that outlives the stack: no backups, no final snapshot, no retained log group.
+#
+# What you need
+#   - A domain name you control. After the stack starts, point an A record for DomainName
+#     at the ElasticIp output. Teleport gets its certificate from Let's Encrypt on first use.
+#     If the name is in a Route 53 hosted zone of this account, pass HostedZoneId and the
+#     stack manages the record for you.
+#   - An Ubuntu 24.04 amd64 image ID for your region (ImageId). To find the current one:
+#       aws ssm get-parameter --query Parameter.Value --output text --name \
+#         /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+#
+# demo.sh at the root of the repository wraps all of this: up, seed, bot, mcp, down.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Cluster address}
+        Parameters: [DomainName, AcmeEmail, AcmeStaging, HostedZoneId]
+      - Label: {default: Host}
+        Parameters: [ImageId, InstanceType, TeleportVersion, TeleportSha256, K3sVersion, K3sSha256, K3sInstallerSha256]
+      - Label: {default: Database}
+        Parameters: [DbInstanceClass, DbEngineVersion, SeedAccess]
+      - Label: {default: Cost alert}
+        Parameters: [AlertEmail, BudgetUsd]
+
+Parameters:
+  DomainName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+    ConstraintDescription: 'A host name, with letters, digits, dots and hyphens only.'
+    Description: Public name of the Teleport cluster, e.g. teleport.example.com.
+  AcmeEmail:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$'
+    ConstraintDescription: 'An email address, with no spaces or shell characters.'
+    Description: Contact address for the Let's Encrypt account.
+  AcmeStaging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Use the Let's Encrypt staging directory. Useful to test the stack without spending
+      certificate quota; tsh and tbot will not trust the certificate.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Optional. Route 53 hosted zone holding DomainName. Empty means you manage the A record yourself.
+
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Ubuntu 24.04 amd64 image. A fixed ID on purpose: a "latest" lookup would replace
+      the host, and Teleport's state with it, on a later stack update.
+  InstanceType:
+    Type: String
+    Default: t3.large
+  TeleportVersion:
+    Type: String
+    Default: 18.11.3
+  TeleportSha256:
+    Type: String
+    Default: 4d3512764c19c5adef8d42d2fdb2d0febeb93b7781a0d0e256d064fc05492ae9
+    Description: SHA-256 of teleport_<version>_amd64.deb, from https://cdn.teleport.dev/teleport_<version>_amd64.deb.sha256.
+  K3sVersion:
+    Type: String
+    Default: v1.36.5+k3s1
+  K3sSha256:
+    Type: String
+    Default: d73847bcd3c5fccef0115b372e2f9a91f3032dc84bbf71518a4617565294d313
+    Description: SHA-256 of the k3s binary, from sha256sum-amd64.txt in the k3s GitHub release.
+  K3sInstallerSha256:
+    Type: String
+    Default: 46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad
+    Description: SHA-256 of install.sh at the K3sVersion tag of github.com/k3s-io/k3s.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbEngineVersion:
+    Type: String
+    Default: '17'
+  SeedAccess:
+    Type: String
+    Default: disabled
+    AllowedValues: [enabled, disabled]
+    Description: >-
+      Lets the host read the database master password, which loading the lab data requires.
+      Off by default: demo.sh seed turns it on for the load, then off again, and turns it off
+      again if the load fails.
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional. Receives the budget alert. Empty means no budget is created.
+  BudgetUsd:
+    Type: Number
+    Default: 50
+    Description: Monthly cost budget for the whole account, in USD. The alert fires at 80%.
+
+Conditions:
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  UseAcmeStaging: !Equals [!Ref AcmeStaging, 'true']
+  SeedEnabled: !Equals [!Ref SeedAccess, enabled]
+
+Resources:
+
+  # ---- Network ------------------------------------------------------------------------------
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Ref 'AWS::StackName'}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-public'}
+
+  # The database subnets have no route to the internet, in or out. RDS needs two zones.
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-db-a'}
+
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-db-b'}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # 443 only. Let's Encrypt validates on it and every Teleport client connects to it.
+  HostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Teleport Proxy on 443
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL from the Teleport host only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref HostSecurityGroup
+
+  Eip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+
+  EipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt Eip.AllocationId
+      InstanceId: !Ref Host
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      TTL: '60'
+      ResourceRecords: [!Ref Eip]
+
+  # ---- Database -----------------------------------------------------------------------------
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${AWS::StackName} private subnets'
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+
+  # PostgreSQL's own log: it records every statement the database refused, which Teleport's
+  # audit log does not mark. Created here, under the name RDS expects, so that it is deleted
+  # with the stack. Left to RDS, the group would be created without an owner and never expire.
+  DbLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${AWS::StackName}-shop/postgresql'
+      RetentionInDays: 7
+
+  # No backups, no snapshot on delete: nothing outlives the stack.
+  Db:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DbLogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-shop'
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: shop
+      MasterUsername: postgres
+      # RDS generates the master password and keeps it in Secrets Manager.
+      ManageMasterUserPassword: true
+      EnableIAMDatabaseAuthentication: true
+      EnableCloudwatchLogsExports: [postgresql]
+      PubliclyAccessible: false
+      MultiAZ: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: false
+      Tags:
+        - {Key: env, Value: demo}
+
+  # ---- Host permissions ---------------------------------------------------------------------
+
+  HostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: teleport-database-service
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Teleport's Database Service signs in to RDS with an IAM token, as this one
+              # database user and no other.
+              - Effect: Allow
+                Action: rds-db:connect
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${Db.DbiResourceId}/oncall_ro'
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+
+  # Reading the master password is needed once, to create the database user and load the
+  # data. A separate policy so that it can be removed afterwards: SeedAccess=disabled.
+  SeedPolicy:
+    Type: AWS::IAM::Policy
+    Condition: SeedEnabled
+    Properties:
+      PolicyName: seed-database
+      Roles: [!Ref HostRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !GetAtt Db.MasterUserSecret.SecretArn
+
+  HostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref HostRole]
+
+  # ---- Host ---------------------------------------------------------------------------------
+
+  BootstrapHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  # The stack is complete only when the host reports that Teleport is running. If the
+  # bootstrap fails, the stack fails with the line number, and /var/log/bootstrap.log has the rest.
+  BootstrapDone:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Host
+    Properties:
+      Handle: !Ref BootstrapHandle
+      Timeout: '1200'
+      Count: 1
+
+  Host:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicRoute
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref HostProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref HostSecurityGroup]
+      PropagateTagsToVolumeOnCreation: true
+      # IMDSv2 only, hop limit 1: a pod on the cluster network cannot obtain the instance role.
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - {Key: Name, Value: !Ref 'AWS::StackName'}
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -Eeuo pipefail
+            exec > >(tee /var/log/bootstrap.log) 2>&1
+
+            signal() {
+              curl -s -X PUT -H 'Content-Type:' \
+                --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"bootstrap\",\"Data\":\"$2\"}" \
+                '${BootstrapHandle}'
+            }
+            trap 'signal FAILURE "bootstrap failed at line $LINENO, see /var/log/bootstrap.log"' ERR
+
+            # Download a file and refuse it unless it matches the expected SHA-256.
+            fetch() {
+              curl -sSfL "$1" -o "$3"
+              echo "$2  $3" | sha256sum -c -
+            }
+
+            # The subnet assigns no public address: wait for the Elastic IP before any download.
+            imds() {
+              local t
+              t=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+              curl -s -H "X-aws-ec2-metadata-token: $t" "http://169.254.169.254/latest/meta-data/$1"
+            }
+            until [ "$(imds public-ipv4)" = "${Eip}" ]; do sleep 3; done
+
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -q
+            apt-get install -y -q postgresql-client jq
+            snap install aws-cli --classic
+
+            cat > /etc/teleport-demo.env <<EOF
+            AWS_DEFAULT_REGION=${AWS::Region}
+            DB_HOST=${Db.Endpoint.Address}
+            DB_SECRET_ARN=${Db.MasterUserSecret.SecretArn}
+            TELEPORT_DOMAIN=${DomainName}
+            EOF
+
+            # ---- k3s, without Traefik or ServiceLB: Teleport owns port 443 on this host.
+            K3S_VERSION='${K3sVersion}'
+            K3S_TAG=$(printf %s "$K3S_VERSION" | sed 's/+/%2B/')
+            fetch "https://github.com/k3s-io/k3s/releases/download/$K3S_TAG/k3s" ${K3sSha256} /usr/local/bin/k3s
+            chmod 755 /usr/local/bin/k3s
+            fetch "https://raw.githubusercontent.com/k3s-io/k3s/$K3S_TAG/install.sh" ${K3sInstallerSha256} /tmp/k3s-install.sh
+            INSTALL_K3S_SKIP_DOWNLOAD=true sh /tmp/k3s-install.sh \
+              --disable traefik --disable servicelb --write-kubeconfig-mode 600
+            until k3s kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 3; done
+
+            # ---- Teleport's credential on the cluster: a service account that can
+            # impersonate users and groups, and nothing else. Teleport acts on the cluster
+            # as whatever group a Teleport role names, never as itself and never as admin.
+            cat > /tmp/teleport-sa.yaml <<'EOF'
+            apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: teleport
+            ---
+            apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: teleport-sa
+              namespace: teleport
+            ---
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: teleport-sa-token
+              namespace: teleport
+              annotations:
+                kubernetes.io/service-account.name: teleport-sa
+            type: kubernetes.io/service-account-token
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRole
+            metadata:
+              name: teleport-role
+            rules:
+              - apiGroups: [""]
+                resources: [users, groups, serviceaccounts]
+                verbs: [impersonate]
+              - apiGroups: [""]
+                resources: [pods]
+                verbs: [get]
+              - apiGroups: [authorization.k8s.io]
+                resources: [selfsubjectaccessreviews, selfsubjectrulesreviews]
+                verbs: [create]
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: teleport-crb
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: teleport-role
+            subjects:
+              - kind: ServiceAccount
+                name: teleport-sa
+                namespace: teleport
+            EOF
+            k3s kubectl apply -f /tmp/teleport-sa.yaml
+            sa() { k3s kubectl -n teleport get secret teleport-sa-token -o "jsonpath={.data.$1}" 2>/dev/null; }
+            until [ -n "$(sa token)" ]; do sleep 1; done
+            SA_TOKEN=$(sa token | base64 -d)
+            SA_CA=$(sa 'ca\.crt')
+
+            # The Kubernetes Service names the cluster after the kubeconfig context.
+            mkdir -p /var/lib/teleport
+            (umask 077; cat > /var/lib/teleport/kubeconfig <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+              - name: demo-k3s
+                cluster:
+                  server: https://127.0.0.1:6443
+                  certificate-authority-data: $SA_CA
+            users:
+              - name: teleport-sa
+                user:
+                  token: $SA_TOKEN
+            contexts:
+              - name: demo-k3s
+                context:
+                  cluster: demo-k3s
+                  user: teleport-sa
+            current-context: demo-k3s
+            EOF
+            )
+
+            # ---- Teleport: Auth, Proxy, Kubernetes and Database services in one process.
+            fetch "https://cdn.teleport.dev/teleport_${TeleportVersion}_amd64.deb" ${TeleportSha256} /tmp/teleport.deb
+            apt-get install -y -q /tmp/teleport.deb
+
+            cat > /etc/teleport.yaml <<EOF
+            version: v3
+            teleport:
+              nodename: teleport-demo
+              data_dir: /var/lib/teleport
+              log:
+                output: stderr
+                severity: INFO
+            auth_service:
+              enabled: "yes"
+              listen_addr: 0.0.0.0:3025
+              cluster_name: ${DomainName}
+              proxy_listener_mode: multiplex
+            ssh_service:
+              enabled: "no"
+            proxy_service:
+              enabled: "yes"
+              web_listen_addr: 0.0.0.0:443
+              public_addr: ${DomainName}:443
+              acme:
+                enabled: "yes"
+                email: ${AcmeEmail}
+            ${AcmeUriLine}
+            kubernetes_service:
+              enabled: "yes"
+              listen_addr: 0.0.0.0:3026
+              kubeconfig_file: /var/lib/teleport/kubeconfig
+              labels:
+                env: demo
+            db_service:
+              enabled: "yes"
+              databases:
+                - name: shop-rds
+                  protocol: postgres
+                  uri: ${Db.Endpoint.Address}:5432
+                  static_labels:
+                    env: demo
+                  aws:
+                    region: ${AWS::Region}
+            EOF
+
+            systemctl enable --now teleport
+            until tctl status >/dev/null 2>&1; do sleep 3; done
+
+            signal SUCCESS "teleport ${TeleportVersion} running"
+          - AcmeUriLine: !If
+              - UseAcmeStaging
+              - '    uri: https://acme-staging-v02.api.letsencrypt.org/directory'
+              - ''
+
+  # ---- Cost alert ---------------------------------------------------------------------------
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-monthly'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+Outputs:
+  ElasticIp:
+    Description: Point the DomainName A record here.
+    Value: !Ref Eip
+  ProxyAddress:
+    Description: What tsh, tbot and the browser connect to.
+    Value: !Sub '${DomainName}:443'
+  InstanceId:
+    Description: The Teleport host. Reach it with Systems Manager, not SSH.
+    Value: !Ref Host
+  DbEndpoint:
+    Value: !GetAtt Db.Endpoint.Address
+  DbResourceId:
+    Value: !GetAtt Db.DbiResourceId
+  DbLogGroup:
+    Description: PostgreSQL log, including every refused statement.
+    Value: !Ref DbLogGroup
+  SeedAccess:
+    Description: Whether the host can still read the database master password.
+    Value: !Ref SeedAccess
